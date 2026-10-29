@@ -85,21 +85,80 @@
         (cs/replace "\\" "%5C"))
     name))
 
+(defn- percent-encode-char
+  [c]
+  (format "%%%02X" (int c)))
+
+(defn- encode-windows-chars
+  "Windows rejects control characters and \" * : < > ? | anywhere in a file name,
+  and silently strips trailing dots and spaces. Mirth generates rule and step
+  names such as 'Accept message if \"msg['MSH']\" equals \"X\"', so these are
+  percent encoded the same way as slashes. The result never contains these
+  characters, so encoding an already encoded name changes nothing."
+  [^String name]
+  (when name
+    (let [encoded (cs/replace name #"[\x00-\x1F\"*:<>?|]" #(percent-encode-char (first %)))]
+      (cs/replace encoded #"[. ]+$" #(apply str (map percent-encode-char %))))))
+
+(def ^:private max-name-bytes
+  "Names longer than this many UTF-8 bytes are shortened. File systems commonly
+  cap a name at 255 bytes, and callers append an extension such as '.js' or
+  '.xml' after safe-name. Shortened names fit in shortened-name-bytes, which
+  leaves room for that extension while staying under this limit, so a shortened
+  name plus its extension is never shortened a second time."
+  240)
+
+(def ^:private shortened-name-bytes 200)
+
+(defn- utf8-length
+  [^String s]
+  (alength (.getBytes s "UTF-8")))
+
+(defn- shorten-long-name
+  "Returns name unchanged if it fits in max-name-bytes. Otherwise keeps as much of
+  the start of the name as fits and appends '-' plus the first 8 hex characters
+  of the SHA-1 of the full name, so distinct long names stay distinct and the
+  same name always maps to the same file."
+  [^String name]
+  (if (or (nil? name) (<= (utf8-length name) max-name-bytes))
+    name
+    (let [digest (.digest (java.security.MessageDigest/getInstance "SHA-1")
+                          (.getBytes name "UTF-8"))
+          suffix (str "-" (subs (apply str (map #(format "%02x" %) digest)) 0 8))
+          budget (- shortened-name-bytes (utf8-length suffix))
+          prefix (loop [end (.length name)]
+                   (let [candidate (subs name 0 end)]
+                     (if (<= (utf8-length candidate) budget)
+                       candidate
+                       (recur (.offsetByCodePoints name (int end) (int -1))))))]
+      (str prefix suffix))))
+
+(defn- assert-single-component
+  [name]
+  (assert
+   (and (string? name) (= name (.getName (File. ^String name))))
+   (str "Name does not appear to be safe"
+        " for file creation - " name
+        " - Check for invalid characters."))
+  name)
+
+(defn legacy-safe-name
+  "safe-name as it behaved before encode-windows-chars and shorten-long-name were
+  added. Used to find script files written by older versions during a push."
+  [name]
+  (some-> name encode-path-chars assert-single-component))
+
 (defn safe-name
   "Asserts that the string param is creatable file that doesn't span paths. Fails
   with an exception if any issues are detected, otherwise returns the unmodified
-  string (unless there are weird characters as defined in encode-path-chars; in
-  which case the string is modified accordingly)."
+  string (unless there are weird characters as defined in encode-path-chars and
+  encode-windows-chars, or the name is too long for shorten-long-name; in which
+  case the string is modified accordingly)."
   [name]
   (log/debugf "safe-name pre: (%s)" name)
-  (if-let [name (encode-path-chars name)]
+  (if-let [name (some-> name encode-path-chars encode-windows-chars shorten-long-name)]
     (do
-      (assert
-       (and (string? name) (= name (.getName (File. ^String name))))
-       (str "Name does not appear to be safe"
-            " for file creation - " name
-            " - Check for invalid characters."))
-
+      (assert-single-component name)
       (log/spyf :debug "safe-name post: (%s)" name))
     name))
 

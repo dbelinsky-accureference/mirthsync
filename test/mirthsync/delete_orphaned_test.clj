@@ -380,3 +380,34 @@
       (is (= (canonical-paths deleted-channel) (canonical-paths @orphans)))
       (is (< @safe-name-calls (* 2 (count local-files)))
           "safe-name calls should grow linearly with the number of files"))))
+
+(deftest expand-filerefs-name-encoding-test
+  (let [dir (build-path "target" "test" "expand-filerefs")
+        main-file (io/file dir "Channel.xml")
+        script-dir (io/file dir "Channel")
+        expand (fn [fileref]
+                 (-> (clojure.data.xml/element :channel {}
+                                               (clojure.data.xml/element :script {:msync-fileref fileref}))
+                     clojure.zip/xml-zip
+                     (->> (expand-filerefs main-file))
+                     clojure.zip/node
+                     :content
+                     first
+                     :content
+                     first))]
+    (.mkdirs script-dir)
+    (try
+      (testing "reads the file written under the current encoded name"
+        (let [fileref (str (mf/safe-name "Set NTE.2.1 to \"TX\"") ".js")]
+          (spit (io/file script-dir fileref) "current();")
+          (is (= "current();" (expand fileref)))))
+
+      (testing "falls back to the name an older version wrote"
+        ;; long names were not shortened before, and unlike quotes they are valid on every OS
+        (let [fileref (str (apply str (repeat 245 "x")) ".js")]
+          (is (not= fileref (mf/safe-name fileref)))
+          (spit (io/file script-dir fileref) "legacy();")
+          (is (= "legacy();" (expand fileref)))))
+      (finally
+        (doseq [f (reverse (file-seq (io/file dir)))]
+          (.delete ^java.io.File f))))))
